@@ -1,10 +1,14 @@
 package opa
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 
+	"github.com/open-policy-agent/opa/v1/ast"
 	"github.com/open-policy-agent/opa/v1/loader"
+	"github.com/open-policy-agent/opa/v1/storage/inmem"
 	"github.com/terraform-linters/tflint-plugin-sdk/hclext"
 	"github.com/terraform-linters/tflint-plugin-sdk/tflint"
 )
@@ -40,23 +44,65 @@ func (r *RuleSet) ApplyConfig(body *hclext.BodyContent) error {
 		return diags
 	}
 
+	// Load local policies first (from policy_dir or the default locations). This
+	// is cheap, local-only work, so doing it before any bundle fetch lets us fail
+	// fast on a misconfiguration without a network round trip.
+	modules := map[string]*ast.Module{}
+	var data map[string]interface{}
+
 	policyDir, err := r.config.policyDir()
 	if err != nil {
-		// If you declare the directory in config or environment variables,
-		// os.ErrNotExist will not be returned, resulting in load errors
-		// later in the process.
-		if os.IsNotExist(err) {
-			return nil
+		// Only os.ErrNotExist is tolerable here. If the directory is explicitly
+		// declared in config or environment variables, os.ErrNotExist will not
+		// be returned, resulting in load errors later in the process.
+		if !os.IsNotExist(err) {
+			return err
 		}
-		return err
+		// No local policy directory present (and none explicitly configured).
+	} else {
+		ret, err := loader.NewFileLoader().Filtered([]string{policyDir}, nil)
+		if err != nil {
+			return fmt.Errorf("failed to load policies; %w", err)
+		}
+		for k, m := range ret.ParsedModules() {
+			modules[k] = m
+		}
+		if len(ret.Documents) > 0 {
+			data = ret.Documents
+		}
 	}
 
-	ret, err := loader.NewFileLoader().Filtered([]string{policyDir}, nil)
-	if err != nil {
-		return fmt.Errorf("failed to load policies; %w", err)
+	// When a bundle is configured, it becomes the policy source. Every rule must
+	// live in the `tflint` package for the custom builtins to resolve, so a bundle
+	// and local policies would always conflict; reject that combination instead of
+	// merging or shadowing. A local directory with no policies (empty, or data
+	// files only) is not a conflict and is simply ignored in favor of the bundle.
+	bundleURL := r.config.bundleURL()
+	if bundleURL != "" {
+		if len(modules) > 0 {
+			return errors.New("bundle_url cannot be used together with local policies; configure only one")
+		}
+		b, err := fetchBundle(context.Background(), bundleURL, bundleCacheDir())
+		if err != nil {
+			return fmt.Errorf("failed to fetch bundle; %w", err)
+		}
+		modules = map[string]*ast.Module{}
+		for _, m := range b.Modules {
+			modules[m.Path] = m.Parsed
+		}
+		data = b.Data
 	}
 
-	engine, err := NewEngine(ret)
+	if len(modules) == 0 {
+		return nil
+	}
+
+	store := inmem.NewFromObject(map[string]interface{}{})
+	if data != nil {
+		store = inmem.NewFromObject(data)
+	}
+
+	engine, err := NewEngine(store, modules)
 	if err != nil {
 		return fmt.Errorf("failed to initialize a policy engine; %w", err)
 	}
@@ -69,7 +115,7 @@ func (r *RuleSet) ApplyConfig(body *hclext.BodyContent) error {
 	}
 
 	regoRuleNames := map[string]bool{}
-	for _, module := range ret.ParsedModules() {
+	for _, module := range modules {
 		for _, regoRule := range module.Rules {
 			ruleName := regoRule.Head.Name.String()
 			if _, exists := regoRuleNames[ruleName]; exists {
@@ -80,10 +126,14 @@ func (r *RuleSet) ApplyConfig(body *hclext.BodyContent) error {
 
 			if testMode {
 				if rule := NewTestRule(regoRule, engine); rule != nil {
+					// Empty for local policies; the bundle URL for bundle-sourced rules.
+					rule.source = bundleURL
 					r.Rules = append(r.Rules, rule)
 				}
 			} else {
 				if rule := NewRule(regoRule, engine); rule != nil {
+					// Empty for local policies; the bundle URL for bundle-sourced rules.
+					rule.source = bundleURL
 					r.Rules = append(r.Rules, rule)
 				}
 			}
